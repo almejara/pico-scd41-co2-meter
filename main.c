@@ -15,115 +15,167 @@
 #include "sensirion_i2c_hal.h"
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
+#include "hardware/uart.h"
+#include "mates/controller.h"
 
-/* //7 segment wiring (adjust as needed):
-#define a_pin       6
-#define b_pin       7
-#define c_pin       8
-#define d_pin       9
-#define e_pin       10
-#define f_pin       11
-#define g_pin       12
-#define digit_1     13
-#define digit_2     14
-#define digit_3     15
-#define digit_4     16 */
 
-//7 segment wiring (adjust as needed):
-#define a_pin       14
-#define b_pin       7
-#define c_pin       10
-#define d_pin       13
-#define e_pin       15
-#define f_pin       12
-#define g_pin       8
-#define digit_1     16
-#define digit_2     11
-#define digit_3     9
-#define digit_4     6
+#define MATES_UART_ID uart1
+#define MATES_BAUD_RATE 19200
 
-//rgb led pins:
-#define led_r       2
-#define led_g       1
-#define led_b       0
+// We are using pins 0 and 1, but see the GPIO function select table in the
+// datasheet for information on which other pins can be used.
+#define UART_TX_PIN 8
+#define UART_RX_PIN 9
 
-//create mask for segment pins
-const uint32_t segment_mask =   (1 << a_pin) |
-                                (1 << b_pin) |
-                                (1 << c_pin) |
-                                (1 << d_pin) |
-                                (1 << e_pin) |
-                                (1 << f_pin) |
-                                (1 << g_pin);
+#define RESET_MATE 7
 
-//create mask for digit pins
-const uint32_t digit_mask =     (1 << digit_1) |
-                                (1 << digit_2) |
-                                (1 << digit_3) |
-                                (1 << digit_4);
 
-const uint32_t rgb_mask =       (1 << led_r) |
-                                (1 << led_g) |
-                                (1 << led_b);
 
-//LUT for segment pins
-//i.e. segment_pins[5] will display the value 5 on the display digit
-const uint32_t segment_pins[10] =
-{
-    //0
-    ((1<<a_pin) | (1<<b_pin) | (1<<c_pin) | (1<<d_pin) | (1<<e_pin) | (1<<f_pin)),
-    //1
-    ((1<<b_pin) | (1<<c_pin)),
-    //2
-    ((1<<a_pin) | (1<<b_pin) | (1<<d_pin) | (1<<e_pin) | (1<<g_pin)),
-    //3
-    ((1<<a_pin) | (1<<b_pin) | (1<<c_pin) | (1<<d_pin) | (1<<g_pin)),
-    //4
-    ((1<<b_pin) | (1<<c_pin) | (1<<f_pin) | (1<<g_pin)),
-    //5
-    ((1<<a_pin) | (1<<c_pin) | (1<<d_pin) | (1<<f_pin) | (1<<g_pin)),
-    //6
-    ((1<<a_pin) | (1<<c_pin) | (1<<d_pin) | (1<<e_pin) | (1<<f_pin) | (1<<g_pin)),
-    //7
-    ((1<<a_pin) | (1<<b_pin) | (1<<c_pin)),
-    //8
-    ((1<<a_pin) | (1<<b_pin) | (1<<c_pin) | (1<<d_pin) | (1<<e_pin) | (1<<f_pin) | (1<<g_pin)),
-    //9
-    ((1<<a_pin) | (1<<b_pin) | (1<<c_pin) | (1<<d_pin) | (1<<f_pin) | (1<<g_pin))
-};
-
-//LUT for digit pins
-//i.e. digit_pins[0] is the most significant digit of the display
-uint32_t digit_pins[4] =
-{
-    digit_1,
-    digit_2,
-    digit_3,
-    digit_4
-};
-
+unsigned long timerMilliseconds = 0;
 uint16_t co2 = 9999;
 int32_t temperature = 0;
 int32_t humidity = 0;
 bool timerFlag = false;
 
+
+
 //function prototypes
-void init_display(void);
-void update_display(uint16_t value);
-void init_rgb(void);
-void update_rgb(uint16_t value);
 
 bool timer_cb(struct repeating_timer *t);
+bool mates_timer_cb(struct repeating_timer *t);
+
+void matesReset(void) {
+    gpio_put(RESET_MATE, PICO_DEFAULT_LED_PIN_INVERTED);
+    sleep_ms(100); // doesn't feel like 5seconds
+    gpio_put(RESET_MATE, !PICO_DEFAULT_LED_PIN_INVERTED);
+}
+
+
+unsigned long millis() {
+    return timerMilliseconds;
+}
+
+
+void matesUartWrite(uint8_t txData)
+{
+    uint8_t src = txData;
+    uart_write_blocking(MATES_UART_ID, &src, 1);
+}
+
+uint8_t matesUartRead(void)
+{
+    uint8_t readValue  = 0;
+    uart_read_blocking(MATES_UART_ID, &readValue, 1);
+    return readValue;
+}
+
+
+// If returns 0, no data is available to be read from UART.
+// If returns nonzero, at least that many bytes can be written without blocking.
+uint8_t matesSerialAvailable(void) {
+    return (uint8_t)uart_is_readable(MATES_UART_ID);
+}
 
 int main() 
 {
+    int16_t val_test = 0;
+    int8_t val_gauge = 0;
+    float temper = 25.2;
     stdio_init_all();
-    init_display();
-    init_rgb();    
+
+    uart_init(MATES_UART_ID, MATES_BAUD_RATE);
+    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
+
+    gpio_init(RESET_MATE);
+    gpio_set_dir(RESET_MATE, GPIO_OUT);
+    gpio_put(RESET_MATE, !PICO_DEFAULT_LED_PIN_INVERTED);
+
+    struct repeating_timer mater_millis;
+    add_repeating_timer_ms(1, mates_timer_cb, NULL, &mater_millis);
+
+
+    mates_attachHwResetFnc(matesReset);
+    mates_attachMillisFnc(millis);
+    mates_attachWriteFnc(matesUartWrite);
+    mates_attachReadFnc(matesUartRead);
+    mates_attachRxCountFnc(matesSerialAvailable);
+
+    if (!mates_begin()) {
+        // Display didn't send ready signal in time
+        while (1) {
+            printf("Error starting display...\n");  
+            sleep_ms(1000);
+        }
+    }
+
+    printf("Start display ok\n");  
+#if 0
+    while(1){
+
+        mates_setPage(0);
+       
+       while(val_test < 20){
+            if(mates_setLedDigitsShortValue(0, val_test) == false)
+            {
+                printf("Error using Led\n");  
+            }
+            sleep_ms(1000);
+            val_test++;
+       }
+    val_gauge = 1;
+    while(val_gauge <= 100){
+        mates_setWidgetValue(MATES_GAUGE_A, 0, val_gauge);
+        val_gauge++;
+        sleep_ms(200);
+    }
+
+       if(mates_setPage(1) == false)
+       {
+            printf("Error setting page\n");
+       }
+        val_test = 0;
+
+        while(val_test < 20){
+            if(mates_setLedDigitsFloatValue(1, temper) == false)
+            {
+                printf("Error using float led");  
+            }
+            sleep_ms(1000);
+            temper += 0.2;
+            if(temper > 90)
+                temper = 25.0;
+
+            val_test++;
+       }
+        val_test = 0;
+
+           if(mates_setPage(2) == false)
+       {
+            printf("Error setting page\n");
+       }
+        val_test = 0;
+
+        while(val_test < 20){
+            if(mates_setLedDigitsFloatValue(2, temper) == false)
+            {
+                printf("Error using float led");  
+            }
+            sleep_ms(1000);
+            temper += 0.2;
+            if(temper > 90)
+                temper = 25.0;
+
+            val_test++;
+       }
+        val_test = 0;
+
+    }
+    #endif
 
     sensirion_i2c_hal_init();
 
-    scd4x_wake_up();
+    //scd4x_wake_up();
     scd4x_stop_periodic_measurement();
     scd4x_reinit();
 
@@ -135,8 +187,10 @@ int main()
 
     while(1)
     {
-        update_display(co2);
-        update_rgb(co2);
+        sleep_ms(1000);
+        printf("Co2 = %d\n", co2);
+        printf("Temp = %.2f °C\n", (float)temperature/1000);
+        printf("humidity = %.2f \%\n", (float)humidity/1000);
 
         if(timerFlag)
         {
@@ -150,77 +204,18 @@ int main()
     return 0;
 }
 
-//function to init the 7 segment display
-void init_display(void)
-{
-    //init 7 segment output pins
-    gpio_init_mask(segment_mask | digit_mask);
-    //set pins as output
-    gpio_set_dir_out_masked(segment_mask | digit_mask);
-}
 
-//function to init the rgb led
-void init_rgb(void)
-{
-    //init the rgb output pins
-    gpio_init_mask(rgb_mask);
-    //set pins as output
-    gpio_set_dir_out_masked(rgb_mask);
-}
-
-//function to update the value of the 7 segment display
-void update_display(uint16_t value)
-{
-    //turn all digits off
-    gpio_put_masked(digit_mask, digit_mask);
-    //turn all segments off
-    gpio_clr_mask(segment_mask);
-
-    int i = 0;
-    do
-    {
-        //turn all digits off
-        gpio_put_masked(digit_mask, digit_mask);
-        //select digit
-        gpio_put(digit_pins[3-i], 0);
-        //write digit value
-        gpio_put_masked(segment_mask, segment_pins[value % 10]);
-        //2000us seems to work well :p
-        sleep_us(2000);
-        i++;
-    } while (value /= 10);
-}
-
-//function to update the air quality RGB led
-void update_rgb(uint16_t value)
-{
-    //good air quality
-    if(value < 800)
-    {
-        gpio_put(led_r, 0);
-        gpio_put(led_g, 1);
-        gpio_put(led_b, 0);
-    }
-    //average air quality
-    else if (value >= 800 && value < 1000)
-    {
-        gpio_put(led_r, 1);
-        gpio_put(led_g, 1);
-        gpio_put(led_b, 0);
-    }
-    //bad air quality
-    else
-    {
-        gpio_put(led_r, 1);
-        gpio_put(led_g, 0);
-        gpio_put(led_b, 0);        
-    }
-}
 
 //timer interrupt callback to poll scd41
 bool timer_cb(struct repeating_timer *t)
 {
     //set flag
     timerFlag = true;
+    return true;
+}
+
+bool mates_timer_cb(struct repeating_timer *t)
+{
+    timerMilliseconds++;
     return true;
 }
